@@ -2115,6 +2115,11 @@ class GenerationMixin:
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         use_model_defaults: Optional[bool] = None,
+        use_diversify = False,
+        diversify_roots = None,
+        return_logprobs = False,
+        debug_dv = False,
+        zero_baseline = False,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         r"""
@@ -2461,8 +2466,15 @@ class GenerationMixin:
                 generation_config=generation_config,
                 synced_gpus=synced_gpus,
                 streamer=streamer,
+                use_diversify=use_diversify,
+                diversify_roots=diversify_roots,
+                return_logprobs= return_logprobs,
+                debug_dv=debug_dv,
+                zero_baseline= zero_baseline,
                 **model_kwargs,
             )
+            if return_logprobs:
+                return result
 
         elif generation_mode in (GenerationMode.BEAM_SAMPLE, GenerationMode.BEAM_SEARCH):
             # 11. interleave input_ids with `num_beams` additional sequences per batch
@@ -3329,6 +3341,11 @@ class GenerationMixin:
         generation_config: GenerationConfig,
         synced_gpus: bool,
         streamer: Optional["BaseStreamer"],
+        use_diversify = False, 
+        diversify_roots = None,
+        return_logprobs = False,
+        debug_dv = False,
+        zero_baseline = False,
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         r"""
@@ -3363,6 +3380,9 @@ class GenerationMixin:
             `return_dict_in_generate=True` or a [`~generation.GenerateEncoderDecoderOutput`] if
             `model.config.is_encoder_decoder=True`.
         """
+        if generation_config.do_sample and (generation_config.top_k > 0 or generation_config.top_p < 1.0):
+            raise NotImplementedError('top-k and top-p sampling are not supported with diversify sampling')
+        
         # init values
         pad_token_id = generation_config._pad_token_tensor
         output_attentions = generation_config.output_attentions
@@ -3370,6 +3390,7 @@ class GenerationMixin:
         output_scores = generation_config.output_scores
         output_logits = generation_config.output_logits
         return_dict_in_generate = generation_config.return_dict_in_generate
+        max_length = generation_config.max_length
         has_eos_stopping_criteria = any(hasattr(criteria, "eos_token_id") for criteria in stopping_criteria)
         do_sample = generation_config.do_sample
 
@@ -3392,7 +3413,12 @@ class GenerationMixin:
         this_peer_finished = False
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         model_kwargs = self._get_initial_cache_position(input_ids, model_kwargs)
-
+        if debug_dv:
+            import pdb; pdb.set_trace() 
+        if use_diversify:
+            nodes = diversify_roots.copy()
+        log_probs_lst = [[] for _ in range(batch_size)]
+        
         model_forward = self.__call__
         if isinstance(model_kwargs.get("past_key_values"), Cache):
             is_compileable = model_kwargs["past_key_values"].is_compileable and self._supports_static_cache
@@ -3406,7 +3432,9 @@ class GenerationMixin:
                 model_forward = self.get_compiled_call(generation_config.compile_config)
 
         is_prefill = True
-        while self._has_unfinished_sequences(this_peer_finished, synced_gpus, device=input_ids.device):
+        while self._has_unfinished_sequences(
+            this_peer_finished, synced_gpus, device=input_ids.device, cur_len=cur_len, max_length=max_length
+        ):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
@@ -3429,12 +3457,14 @@ class GenerationMixin:
             if synced_gpus and this_peer_finished:
                 continue
 
-            # Copy is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
+            # Clone is needed to avoid keeping a hanging ref to outputs.logits which may be very large for first iteration
             # (the clone itself is always small)
-            next_token_logits = outputs.logits[:, -1, :].to(copy=True, dtype=torch.float32, device=input_ids.device)
+            next_token_logits = outputs.logits[:, -1, :].clone().float()
+            next_token_logits = next_token_logits.to(input_ids.device)
 
             # pre-process distribution
-            next_token_scores = logits_processor(input_ids, next_token_logits)
+            #next_token_scores = logits_processor(input_ids, next_token_logits)
+            next_token_scores = next_token_logits
 
             # Store scores, attentions and hidden_states when required
             if return_dict_in_generate:
@@ -3457,17 +3487,58 @@ class GenerationMixin:
                     )
 
             # token selection
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                # TODO (joao): this OP throws "skipping cudagraphs due to ['incompatible ops']", find solution
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+            next_tokens = torch.full((batch_size,), pad_token_id, dtype=torch.long, device=next_token_scores.device)
+            
+            log_probs = torch.nn.functional.log_softmax(next_token_scores, dim=-1)  # Compute log-probabilities once
 
+            for batch_idx in range(batch_size):
+                if not unfinished_sequences[batch_idx]:
+                    continue
+
+                batch_log_probs = log_probs[batch_idx]  # Extract log-probs for this batch index
+
+                if use_diversify:
+                    # Adjust log-probs for forbidden completions
+                    if nodes[batch_idx] is not None:
+                        adjust_next_token_log_probs(nodes[batch_idx], batch_log_probs)
+                    
+                    # Check if all probabilities have been zeroed out
+                    if torch.logsumexp(batch_log_probs, dim=0) == float('-inf'):
+                        unfinished_sequences[batch_idx] = 0  # Mark sequence as finished
+                        log_probs_lst[batch_idx].append(float('-inf'))  # Append -inf to log-probs
+                        continue
+                elif zero_baseline:
+                    # Ensure finished sequences are handled consistently
+                    if torch.logsumexp(batch_log_probs, dim=0) == float('-inf'):
+                        unfinished_sequences[batch_idx] = 0  # Mark sequence as finished
+                        log_probs_lst[batch_idx].append(float('-inf'))  # Append -inf to log-probs
+                        continue
+
+                # Select the next token based on the specified method
+                if do_sample and generation_config.temperature > 0.0:
+                    logits_to_sample = batch_log_probs / generation_config.temperature
+                    categorical = torch.distributions.Categorical(logits=logits_to_sample)
+                    next_token = categorical.sample()
+                else:
+                    next_token = torch.argmax(batch_log_probs)
+
+                # Store the selected token and its log-probability
+                next_tokens[batch_idx] = next_token
+                log_probs_lst[batch_idx].append(batch_log_probs[next_token].item())
+
+               
             # finished sentences should have their next token be a padding token
             if has_eos_stopping_criteria:
                 next_tokens = next_tokens * unfinished_sequences + pad_token_id * (1 - unfinished_sequences)
 
+            if use_diversify:
+                for batch_idx, unfinished in enumerate(unfinished_sequences):
+                    if unfinished:
+                        if nodes[batch_idx] is not None and next_tokens[batch_idx].item() in nodes[batch_idx].children:
+                            nodes[batch_idx] = nodes[batch_idx].children[next_tokens[batch_idx].item()]
+                        else:
+                            nodes[batch_idx] = None
+                
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens[:, None]], dim=-1)
             if streamer is not None:
@@ -3507,7 +3578,7 @@ class GenerationMixin:
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids
+            return (input_ids, log_probs_lst) if return_logprobs else input_ids
 
     # Auxiliary functions for beam search
     def _temporary_reorder_cache(self, past_key_values, beam_idx):
